@@ -14,9 +14,13 @@ class LAHeart(Dataset):
         self.sp_transform = sp_transform
         self.sample_list = []
         print(train_flod)
-        if split=='train':
-            with open(self._base_dir+'/../Flods/'+train_flod, 'r') as f:
-                self.image_list = f.readlines()
+        # 使用绝对路径访问Flods文件夹
+        import os
+        base_dir = os.path.abspath(self._base_dir)
+        flods_dir = os.path.join(base_dir, 'Flods')
+        file_path = os.path.join(flods_dir, train_flod)
+        with open(file_path, 'r') as f:
+            self.image_list = f.readlines()
         self.image_list = [item.replace('\n','') for item in self.image_list]
 
         print("total {} unlabel_samples".format(len(self.image_list)))
