@@ -16,11 +16,11 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from networks.vnet import VNet
 from networks.ResNet34 import Resnet34
-from utils import ramps, losses
-from dataloaders.la_heart import LAHeart, RandomCrop, ToTensor, TwoStreamBatchSampler
+from utils import ramps, losses, active_learning
+from dataloaders.pancreas import Pancreas, RandomCrop, ToTensor, TwoStreamBatchSampler
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--root_path', type=str, default='dataset_path', help='Name of Experiment')               # todo change dataset path
+parser.add_argument('--root_path', type=str, default='dataset/LA', help='Name of Experiment')               # Fixed dataset path to LA heart dataset
 parser.add_argument('--exp', type=str,  default="MCF_flod0", help='model_name')                               # todo model name
 parser.add_argument('--max_iterations', type=int,  default=6000, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
@@ -34,6 +34,11 @@ parser.add_argument('--ema_decay', type=float,  default=0.999, help='ema_decay')
 parser.add_argument('--consistency_type', type=str,  default="mse", help='consistency_type')
 parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')
+### active learning
+parser.add_argument('--active_learning', type=bool, default=False, help='whether to use active learning')
+parser.add_argument('--query_strategy', type=str, default='entropy', help='active learning query strategy')
+parser.add_argument('--num_query', type=int, default=10, help='number of samples to query each round')
+parser.add_argument('--query_interval', type=int, default=500, help='query interval in iterations')
 
 args = parser.parse_args()
 
@@ -91,9 +96,12 @@ if __name__ == "__main__":
     ## make logger file
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
-    if os.path.exists(snapshot_path + '/code'):
-        shutil.rmtree(snapshot_path + '/code')
-    shutil.copytree('.', snapshot_path + '/code', shutil.ignore_patterns(['.git','__pycache__']))
+    # Skip code copying to avoid permission issues
+    logging.info('Skipping code copying to avoid permission issues')
+    
+    # Create log directory if it doesn't exist
+    log_dir = os.path.join(snapshot_path, 'log')
+    os.makedirs(log_dir, exist_ok=True)
 
     logging.basicConfig(filename=snapshot_path+"/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
@@ -104,16 +112,20 @@ if __name__ == "__main__":
         # Network definition
         if name == 'vnet':
             net = VNet(n_channels=1, n_classes=num_classes, normalization='batchnorm', has_dropout=True)
-            model = net.cuda()
         if name == 'resnet34':
             net = Resnet34(n_channels=1, n_classes=num_classes, normalization='batchnorm', has_dropout=True)
+        
+        # Use CUDA if available
+        if torch.cuda.is_available():
             model = net.cuda()
+        else:
+            model = net
         return model
 
     model_vnet = create_model(name='vnet')
     model_resnet = create_model(name='resnet34')
 
-    db_train = LAHeart(base_dir=train_data_path,
+    db_train = Pancreas(base_dir=train_data_path,
                                split='train',
                                train_flod='train0.list',                   # todo change training flod
                                common_transform=transforms.Compose([
@@ -146,6 +158,17 @@ if __name__ == "__main__":
     lr_ = base_lr
     model_vnet.train()
     model_resnet.train()
+    
+    # Initialize active learner
+    if args.active_learning:
+        active_learner = active_learning.ActiveLearner(model_vnet, query_strategy=args.query_strategy)
+        # Use standard sampler for unlabeled loader
+        unlabeled_loader = DataLoader(db_train, batch_size=batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(unlabeled_idxs),
+                                     num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+        logging.info(f"Active learning enabled with {args.query_strategy} strategy")
+    
+    # Initialize loss history tracking
+    loss_history = {'iter': [], 'v_loss': [], 'r_loss': [], 'v_supervised_loss': [], 'r_supervised_loss': []}
 
     for epoch_num in tqdm(range(max_epoch), ncols=70):
         time1 = time.time()
@@ -155,8 +178,13 @@ if __name__ == "__main__":
             volume_batch1, volume_label1 = sampled_batch[0]['image'], sampled_batch[0]['label']
             volume_batch2, volume_label2 = sampled_batch[1]['image'], sampled_batch[1]['label']
 
-            v_input,v_label = volume_batch1.cuda(), volume_label1.cuda()
-            r_input,r_label = volume_batch2.cuda(), volume_label2.cuda()
+            # Use CUDA if available
+            if torch.cuda.is_available():
+                v_input,v_label = volume_batch1.cuda(), volume_label1.cuda()
+                r_input,r_label = volume_batch2.cuda(), volume_label2.cuda()
+            else:
+                v_input,v_label = volume_batch1, volume_label1
+                r_input,r_label = volume_batch2, volume_label2
 
             v_outputs = model_vnet(v_input)
             r_outputs = model_resnet(r_input)
@@ -244,6 +272,13 @@ if __name__ == "__main__":
             writer.add_scalar('loss/r_supervised_loss', r_supervised_loss, iter_num)
             writer.add_scalar('loss/r_mse', r_mse, iter_num)
             writer.add_scalar('train/Good_student', Good_student, iter_num)
+            
+            # Track loss history
+            loss_history['iter'].append(iter_num)
+            loss_history['v_loss'].append(v_loss.item())
+            loss_history['r_loss'].append(r_loss.item())
+            loss_history['v_supervised_loss'].append(v_supervised_loss.item())
+            loss_history['r_supervised_loss'].append(r_supervised_loss.item())
 
             logging.info(
                 'iteration ： %d v_supervised_loss : %f v_loss_seg : %f v_loss_seg_dice : %f v_loss_mse : %f r_supervised_loss : %f r_loss_seg : %f r_loss_seg_dice : %f r_loss_mse : %f Good_student: %f'  %
@@ -264,6 +299,30 @@ if __name__ == "__main__":
             time1 = time.time()
 
             iter_num = iter_num + 1
+            
+            # Active learning query step
+            if args.active_learning and iter_num % args.query_interval == 0 and iter_num != 0:
+                model_vnet.eval()
+                selected_indices = active_learner.query(unlabeled_loader, num_query=args.num_query)
+                
+                # Update labeled and unlabeled indices
+                labeled_idxs.extend([unlabeled_idxs[i] for i in selected_indices])
+                unlabeled_idxs = [unlabeled_idxs[i] for i in range(len(unlabeled_idxs)) if i not in selected_indices]
+                
+                # Update batch sampler
+                batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size - labeled_bs)
+                trainloader = DataLoader(
+                    db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=True,
+                    worker_init_fn=worker_init_fn
+                )
+                
+                # Update unlabeled loader for next query
+                unlabeled_loader = DataLoader(db_train, batch_sampler=TwoStreamBatchSampler(unlabeled_idxs, [], batch_size, batch_size), 
+                                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+                
+                model_vnet.train()
+                logging.info(f'Active learning: selected {len(selected_indices)} samples, labeled set size: {len(labeled_idxs)}')
+            
             if iter_num >= max_iterations:
                 break
         if iter_num >= max_iterations:
@@ -278,3 +337,8 @@ if __name__ == "__main__":
     logging.info("save model to {}".format(save_mode_path_resnet))
 
     writer.close()
+    
+    # Save loss history
+    loss_history_path = os.path.join(snapshot_path, 'loss_history.npy')
+    np.save(loss_history_path, loss_history)
+    logging.info(f'Saved loss history to {loss_history_path}')
