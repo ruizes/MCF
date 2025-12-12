@@ -1,0 +1,9 @@
+Flask==2.0.1
+Flask-CORS==3.0.10
+Werkzeug==2.0.3
+numpy==1.26.4
+torch==2.9.1
+torchvision==0.24.1
+medpy==0.4.0
+h5py==3.10.0
+nibabel==3.2.1
