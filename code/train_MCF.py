@@ -69,6 +69,31 @@ def update_ema_variables(model, ema_model, alpha, global_step):
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
+def calculate_uncertainty(outputs):
+    # Calculate uncertainty using entropy
+    eps = 1e-6
+    entropy = -torch.sum(outputs * torch.log(outputs + eps), dim=1)
+    return entropy
+
+def generate_pseudo_labels_ua_mt(model1, model2, inputs, threshold=0.5):
+    # UA-MT pseudo label generation method from https://github.com/yulequan/UA-MT
+    with torch.no_grad():
+        output1 = F.softmax(model1(inputs), dim=1)
+        output2 = F.softmax(model2(inputs), dim=1)
+        
+        # Calculate uncertainties
+        uncertainty1 = calculate_uncertainty(output1)
+        uncertainty2 = calculate_uncertainty(output2)
+        
+        # Combine predictions based on uncertainty
+        combined_output = torch.where(uncertainty1 < uncertainty2, output1, output2)
+        
+        # Generate pseudo labels with confidence threshold
+        max_probs, pseudo_labels = torch.max(combined_output, dim=1)
+        pseudo_labels[max_probs < threshold] = -1  # Ignore low-confidence predictions
+        
+        return pseudo_labels, combined_output
+
 def worker_init_fn(worker_id):
     random.seed(args.seed+worker_id)
 
@@ -189,6 +214,10 @@ if __name__ == "__main__":
             v_supervised_loss =  (v_loss_seg + v_loss_seg_dice) + 0.5 * v_mse
             r_supervised_loss =  (r_loss_seg + r_loss_seg_dice) + 0.5 * r_mse
 
+            # Generate pseudo labels using UA-MT method
+            pseudo_labels, combined_output = generate_pseudo_labels_ua_mt(model_vnet, model_resnet, v_input[labeled_bs:], threshold=0.7)
+            
+            # Original pseudo label generation method
             v_outputs_clone = v_outputs_soft[labeled_bs:, :, :, :, :].clone().detach()
             r_outputs_clone = r_outputs_soft[labeled_bs:, :, :, :, :].clone().detach()
             v_outputs_clone1 = torch.pow(v_outputs_clone, 1 / T)
@@ -199,9 +228,9 @@ if __name__ == "__main__":
             r_outputs_PLable = torch.div(r_outputs_clone1, r_outputs_clone2)
 
             if Good_student == 0:
-                Plabel = v_outputs_PLable
+                Plabel = combined_output  # Use UA-MT pseudo labels
             if Good_student == 1:
-                Plabel = r_outputs_PLable
+                Plabel = combined_output  # Use UA-MT pseudo labels
 
             consistency_weight = get_current_consistency_weight(iter_num//150)
             if Good_student == 0:
